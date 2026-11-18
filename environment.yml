@@ -1,0 +1,8 @@
+name: paratyphiA
+channels:
+- conda-forge
+- bioconda
+dependencies:
+- bioconda::nextflow=25.04.6
+- conda-forge::apptainer=1.4.2
+- bioconda::bakta=1.11.4

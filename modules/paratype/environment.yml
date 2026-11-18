@@ -1,0 +1,10 @@
+channels:
+- conda-forge
+- bioconda
+dependencies:
+- samtools=1.13
+- bcftools=1.13
+- bowtie2=2.3
+- bwa=0.7
+- argparse
+- biopython=1.79

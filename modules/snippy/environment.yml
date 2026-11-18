@@ -1,0 +1,6 @@
+channels:
+- conda-forge
+- bioconda
+dependencies:
+- bioconda::snippy=4.6.0
+- bioconda::snpeff=5.0
