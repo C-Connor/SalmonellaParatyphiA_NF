@@ -1,0 +1,6 @@
+[submodule "assets/assets/Paratype"]
+	path = assets/assets/Paratype
+	url = https://github.com/CHRF-Genomics/Paratype
+[submodule "assets/Paratype"]
+	path = assets/Paratype
+	url = https://github.com/CHRF-Genomics/Paratype
