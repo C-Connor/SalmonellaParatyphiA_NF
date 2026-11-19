@@ -1,0 +1,1665 @@
+---
+title: "ParatyphiA_Analysis"
+output: html_document
+date: "2025-09-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse,
+  dplyr,
+  magrittr,
+  ggplot2,
+  ggpubr,
+  ggtext,
+  ggh4x,
+  readxl,
+  lubridate,
+  ggtree,
+  ggtreeExtra,
+  treeio,
+  stringr,
+  ape,
+  phangorn,
+  aplot,
+  ggbeeswarm,
+  reshape2,
+  gggenomes,
+  ggpubr,
+  ggnewscale,
+  ragg,
+  geomtextpath,
+  emmeans
+  )
+```
+
+
+```{r}
+knitr::opts_chunk$set(dev = "ragg_png")
+```
+
+
+#Read in files
+```{r}
+MDUMetadata <- read_excel("../../MDU_Metadata/MDUMetadata.xlsx",sheet = 'Cleaned')
+DHTraveldata <- read_excel("../../MDU_Metadata/DHTravelData.xlsx")
+ShortReadGenomics <-read.csv("../NextflowResults/ShortReadCollatedNextflowResults.csv")
+LongReadGenomics <- read.csv("../NextflowResults/LongAssemblyCollatedNextflowResults.csv")
+SNPdists <- read.csv("../NextflowResults/GubbinsRcomMasked-SNPdists.tab",sep='\t',header = FALSE)
+rfbLocusDepth <- read.csv("../NextflowResults/rfbLocusSeqDepth.csv")
+NNDSS_state <- read_excel("../../NNDSS/Notifications Received By Jurisdiction.xlsx",skip = 2)
+NNDSS_sex <- read_excel("../../NNDSS/Notifications By Age Groups and Sex.xlsx",skip = 2)
+
+raxmlTree <- read.tree('../raxml/GubbinsRecombMasked.aln.raxml.bestTreeCollapsed')
+
+
+#give snp dists col names
+colnames(SNPdists) <- c("Sample1","Sample2","SNPdistance")
+#remove snippyOut
+SNPdists %<>%
+  mutate(
+    Sample1 = gsub("_snippyOut","",Sample1),
+    Sample2 = gsub("_snippyOut","",Sample2)
+  )
+
+#add in patient ID columns to SNPdists
+SNPdists %<>%
+  left_join(
+    select(MDUMetadata,SampleID,patient_id,collection_date),by=join_by(Sample1==SampleID)
+  ) %>%
+  rename(Sample1_patientID = patient_id,Sample1_collection_date = collection_date) %>%
+  left_join(
+    select(MDUMetadata,SampleID,patient_id,collection_date),by=join_by(Sample2==SampleID)
+  ) %>%
+  rename(Sample2_patientID = patient_id,Sample2_collection_date = collection_date) %>%
+  mutate(
+    SamePatient = case_when(
+      Sample1_patientID == Sample2_patientID ~ T,
+      T ~ F
+    ),
+    DaysBetweenSamples = abs(difftime(ymd(Sample1_collection_date), ymd(Sample2_collection_date), units='days'))
+  )
+
+#Merge MDU metadata and DH travel data
+AllMetadata <- MDUMetadata %>%
+  select(-ReportedTravel,-ReportedTravelCountry) %>%
+  left_join(DHTraveldata,by='SampleID')
+
+#merge short read genomics and MDU metadata
+SRGenomicsPlusMeta <- AllMetadata %>% left_join(ShortReadGenomics,by='SampleID')
+
+#fix tree tip labels
+raxmlTree$tip.label <- unlist(lapply(raxmlTree$tip.label,strsplit,split='_snippyOut'))
+
+MDRPlasmidBaktaTsv <- read.csv("../MDRPlasmidBakta/AUSMDU00127576_MDRplasmid_bakta.tsv",sep='\t',skip = 5)
+
+#total number of travllers from ABS
+TravelData <- read.csv("../ABS,OAD_COUNTRY,1.0.0+all.csv")
+```
+
+```{r}
+filelist <- Sys.glob("../plasmid/pGY1andpGY2_blastresults/*.blasthits")
+filelist_nonempty <- filelist[which(file.info(filelist)$size>0)]
+
+results <- lapply(filelist_nonempty,read.csv,header=F,sep='\t')
+names(results) <- unlist(lapply(filelist_nonempty,gsub,pattern='../plasmid/pGY1andpGY2_blastresults/',replacement=''))
+mergedResults <- imap_dfr(results, ~ mutate(.x, id = .y))
+colnames(mergedResults) <- c("QueryID","SubjectID","QueryLen","SubjectLen","Length","Pident","Qcov","QcovHSP","SampleID")
+mergedResults %<>%
+  mutate(
+    SampleID = gsub(".blasthits","",SampleID)
+  )
+```
+
+```{r}
+includedSampleIDs <- SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients==T) %>%
+  pull(SampleID)
+```
+
+
+```{r}
+pGY1sampleIDs <- mergedResults %>%
+  filter(SampleID %in% includedSampleIDs) %>%
+  filter(
+    (QueryID == "pGY1_doubled" & Length > (3593*0.8)) | (QueryID=='pGY2_doubled' & Length > (2607*0.8)), Pident > 90
+  ) %>%
+  distinct(QueryID,SampleID) %>%
+  filter(QueryID == 'pGY1_doubled') %>%
+  pull(SampleID)
+
+pGY2sampleIDs <- mergedResults %>%
+  filter(SampleID %in% includedSampleIDs) %>%
+  filter(
+    (QueryID == "pGY1_doubled" & Length > (3593*0.8)) | (QueryID=='pGY2_doubled' & Length > (2607*0.8)), Pident > 90
+  ) %>%
+  distinct(QueryID,SampleID) %>%
+  filter(QueryID == 'pGY2_doubled') %>%
+  pull(SampleID)
+```
+
+# List of Sample IDs for tree - one sample per patient
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included' & UniquePatients == TRUE) %>%
+  select(SampleID) %>%
+  write.table('../SampleIDsForTreeAndPangenome.list',col.names = FALSE,row.names=FALSE,quote=FALSE)
+```
+
+#average notifications per quarter excluding lockdown periods
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(
+    InclusionExclusion == 'included',
+    UniquePatients == TRUE
+    ) %>%
+  mutate(
+    Quarter = floor_date(ymd(collection_date),unit = 'quarter') + days(45)
+    ) %>%
+  count(Quarter) %>%
+  filter(!Quarter %in% c('2020-05-16','2021-08-15','2021-11-15')) %>%
+  summarise(mean(n))
+```
+
+#get averages per quarter
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(
+    InclusionExclusion == 'included',
+    UniquePatients == TRUE
+    ) %>%
+  mutate(
+    Quarter = floor_date(ymd(collection_date),unit = 'quarter') + days(45)
+  ) %>%
+  count(Quarter) %>%
+  filter(!Quarter %in% c('2020-05-16','2021-08-15','2021-11-15')) %>%
+  mutate(
+    Q = quarter(Quarter)
+  ) %>%
+  group_by(Q) %>%
+  summarise(mean(n))
+```
+
+#sample type bar graph
+```{r}
+plot.Meta.SampleTypeTime <- SRGenomicsPlusMeta %>%
+  filter(
+    InclusionExclusion == 'included',
+    UniquePatients == TRUE
+    ) %>%
+  mutate(
+    Quarter = floor_date(ymd(received_date),unit = 'quarter') + days(45),
+    `Sample Type` = case_when(
+      site == "FAECES" ~ "Faecal",
+      site %in% c("BLOOD","BLOOD CULTURE") ~ 'Blood',
+      site == "URINE" ~ "Urine",
+      site == 'TISSUE' ~ 'Tissue',
+      T ~ 'Unknown'
+    )
+  ) %>%
+  group_by(Quarter,`Sample Type`) %>%
+  summarise(count=n()) %>%
+  ggplot(aes(x=Quarter,fill=`Sample Type`,y=count)) +
+  geom_bar(stat='identity') +
+  scale_fill_manual(values = c(
+    "Faecal" = '#a6611a',
+    "Blood" = "#d53e4f",
+    'Urine' = '#fee090',
+    'Tissue' = '#e9a3c9',
+    'Unknown' = 'grey'
+  )) +
+  theme_bw() +
+  labs(
+    x='Date of Sample Receipt (Grouped by Quarter)',
+    y='Case Count'
+  ) +
+    annotate('rect',xmin = ymd('2020-04-01'), xmax = ymd('2022-01-01'),ymin = -Inf, ymax=Inf,alpha=0.25)
+plot.Meta.SampleTypeTime
+
+#ggsave("Figures/SampleTypeOverTime.pdf",dpi=300,units = 'cm',width = 18,height = 10)
+```
+
+#reported travel bar graph
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(
+    InclusionExclusion == 'included',
+    UniquePatients == TRUE
+    ) %>%
+  mutate(
+    Quarter = floor_date(ymd(collection_date),unit = 'quarter') + days(45)
+  ) %>%
+  ggplot(aes(x=Quarter,fill=InfectionSource)) +
+  geom_bar() +
+  scale_fill_manual(
+    values = c(
+      "Close contact" = "#d95f02",
+      "Travel" = "#1b9e77",
+      "Unknown" = "grey"
+    )
+  ) +
+  theme_bw() +
+  labs(
+    x='Date of Collection (Grouped by Quarter)',
+    y='Count of Unique Cases'
+  )
+```
+
+#count of reported travel
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == TRUE) %>%
+  count(InfectionSource)
+```
+
+#Region of travel
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == TRUE, InfectionSource == 'Travel') %>%
+  count(RegionOfTravel)
+```
+
+#Country of travel
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == T, InfectionSource == 'Travel') %>%
+  count(CountryOfTravel,RegionOfTravel,sort = T)
+```
+
+
+#total number of travellers
+
+from ABSTotalTravellersByState 15635930 travellers returning to Vic
+
+```{r}
+totalTravelData <- TravelData %>%
+  mutate(
+    TimePeriodFixed = ym(TIME_PERIOD)
+  ) %>%
+  filter(
+    CAT_TRAVELLER == 5, #returning travellers
+    TimePeriodFixed >= "2018-07-01", 
+    TimePeriodFixed < "2025-10-01",
+    !(COUNTRY_RESID %in% c(paste("TO",1:9,sep=""),"TOT")) #remove totals
+    ) %>% 
+  group_by(Country.of.Stay.Residence) %>%
+  summarise(
+    Total = sum(OBS_VALUE)
+  ) %>%
+  mutate(
+    NormToTotal = (Total / 56417890), #taken from total row in df
+  ) %>%
+  mutate(
+    ProjectToVic = NormToTotal * 15635930
+  ) %>%
+  arrange(desc(ProjectToVic))
+totalTravelData
+```
+
+Merge across total travellers and normalise
+
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == T, InfectionSource == 'Travel') %>%
+  count(CountryOfTravel,RegionOfTravel,sort = T) %>%
+  left_join(totalTravelData,by = join_by(CountryOfTravel==Country.of.Stay.Residence)) %>%
+  mutate(
+    Incidence = (n / ProjectToVic) * 100000 #per 100,000 travellers
+  )
+```
+
+
+#NNDSS and WSG cases graph - figure 1
+```{r}
+wgsCases <- SRGenomicsPlusMeta %>%
+  filter(
+    InclusionExclusion == 'included',
+    UniquePatients == TRUE
+    ) %>%
+  mutate(
+    Quarter = floor_date(ymd(received_date),unit = 'quarter') + days(45) #swap to received date as collection date is sometimes empty
+  ) %>%
+  group_by(Quarter,InfectionSource) %>%
+  summarise(count=n())# %>%
+  #pivot_wider(names_from = ReportedTravel,names_prefix = "WGS_ReportedTravel_",values_from = count)
+
+reportedCases <- NNDSS_state %>%
+  filter(
+    `Diagnosis Year Drill Down - Diagnosis Year` %in% c("2018","2019","2020","2021","2022","2023","2024","2025"),
+    State == 'VIC'
+    ) %>%
+  mutate(
+    Quarter = floor_date(
+      ymd(paste(`Diagnosis Year Drill Down - Diagnosis Year` , `Diagnosis Year Drill Down - Diagnosis Month Name`,'01',sep='-')),
+      unit='quarter') + days(45)
+  ) %>%
+  group_by(Quarter) %>%
+  summarise(NNDSS_notifications = sum(Count_Notification_ForGraph)) %>%
+  filter(!Quarter %in% c("2018-02-15","2018-05-16")) #remove first two quarters which we don't have MDU data for
+
+plot.NNDSandWGS <- wgsCases %>%
+  ggplot(aes(x=Quarter,fill=InfectionSource,y=count)) +
+  geom_bar(stat='identity') +
+  scale_fill_manual(values = c('Travel' = '#1b9e77','Close contact' = '#d95f02','Unknown'='grey')) +
+  geom_line(data=reportedCases, aes(x=Quarter,y=NNDSS_notifications,colour='Notifications'),inherit.aes = F,linewidth = 1) +
+  scale_color_manual(values = c("Notifications" = "#7570b3")) +
+  theme_bw() +
+  #theme(legend.title = element_blank()) +
+  labs(
+    y="Case Count",
+    x="Date of Sample Receipt / Notification (Grouped by Quarter)",
+    fill="Reported Risk for WGS Cases",
+    colour="National Disease Surveillance"
+  ) +
+  annotate('rect',xmin = ymd('2020-04-01'), xmax = ymd('2022-01-01'),ymin = -Inf, ymax=Inf,alpha=0.25)
+
+plot.NNDSandWGS
+#ggsave("Figures/NotificationsGenomesOverTime.pdf",dpi=300,units = 'cm',width = 18,height = 10)
+  
+```
+
+# ITS test
+
+```{r}
+borderclose_q <- as.Date("2020-04-01") # quarter containing closure
+borderreopen_q <- as.Date("2022-01-01") # quarter containing reopening
+
+its_df <- reportedCases %>%
+  arrange(Quarter) %>%
+  mutate(
+    t   = row_number(),
+    qtr = factor(quarter(Quarter)),
+    phase = case_when(
+      Quarter < borderclose_q ~ "pre",
+      Quarter == borderclose_q ~ "transition1",
+      Quarter < borderreopen_q ~ "closed",
+      Quarter == borderreopen_q ~ "transition2",
+      TRUE ~ "post"
+      ),
+    phase = factor(phase, levels = c("pre", "transition1", "closed", "transition2", "post"))
+  )
+
+#exclude transition quarters
+its_filt_df <- its_df %>% filter(!phase %in% c("transition1", "transition2")) %>%
+  mutate(phase = droplevels(phase))
+its_filt_df
+```
+
+```{r}
+glm_pois <- glm(NNDSS_notifications ~ phase + t + qtr, family = poisson, data = its_filt_df)
+summary(glm_pois)
+# Dispersion check: should be close to 1
+sum(residuals(glm_pois, type = "pearson")^2) / glm_pois$df.residual
+```
+
+From results above:
+Everything is compared to phase-pre border closures
+Significance means difference can be detected, non-significance just means difference not detected / not able to be detected
+Rate ratios (i.e. percentage change) can be calculated from exp(Estimate) - test is in log space
+The quarters are all compared to t0 (q1)
+
+the dispersion (sum residuals) should be close to 1, 1.22 is ok ish
+
+
+Rate ratios can be calculated with the below for the different phases
+```{r}
+glm_rr <- glm(NNDSS_notifications ~ phase + t + qtr, family = poisson, data = its_filt_df)
+emmeans(glm_rr, ~ phase) %>%
+  contrast(list("closed vs pre" = c(-1, 1, 0), "post vs pre" = c(-1, 0, 1)),
+           type = "response", infer = TRUE)
+```
+
+For comparing year quarters and getting CI's
+```{r}
+emmeans(glm_pois, ~ qtr, type = "response") %>%
+  contrast(method = "trt.vs.ctrl", ref = 1, infer = TRUE)
+```
+
+Check autocorrelation
+Values shouldn't exceed blue lines, except for t0
+```{r}
+#Check autocorrelation
+acf(residuals(glm_pois, type = "pearson"))
+```
+
+Autocorrelation looks ok
+
+# Country of travel over time
+```{r}
+plot.fill.Country <- c(
+    'Cambodia' = '#7079df',
+    'Hong Kong (SAR of China)' = '#6aa859',
+    'India'='#c06fc2',
+    'Indonesia' = '#c2893c',
+    'Nepal' = '#5794d7',
+    'Pakistan' = '#d75f79',
+    'Unknown' = 'grey'
+    )
+
+plot.Meta.CountryTime <- SRGenomicsPlusMeta %>%
+  filter(
+    InclusionExclusion == 'included',
+    UniquePatients == TRUE,
+    InfectionSource == 'Travel'
+    ) %>%
+  mutate(
+    Quarter = floor_date(ymd(received_date),unit = 'quarter') + days(45) #swap to received date as collection date is sometimes empty
+  ) %>%
+  group_by(Quarter,CountryOfTravel) %>%
+  summarise(count=n()) %>%
+  #pivot_wider(names_from = ReportedTravel,names_prefix = "WGS_ReportedTravel_",values_from = count)
+  ggplot(aes(x=Quarter,fill=CountryOfTravel,y=count)) +
+  geom_bar(stat='identity') +
+  scale_fill_manual(values = plot.fill.Country
+    ) +
+  #geom_line(data=reportedCases, aes(x=Quarter,y=NNDSS_notifications,colour='Notifications'),inherit.aes = F,linewidth = 1) +
+  scale_color_manual(values = c("Notifications" = "#7570b3")) +
+  theme_bw() +
+  #theme(legend.title = element_blank()) +
+  labs(
+    y="Case Count",
+    x="Date of Sample Receipt (Grouped by Quarter)",
+    fill="Country of Travel",
+    #colour="National Disease Surveillance"
+  ) +
+  annotate('rect',xmin = ymd('2020-04-01'), xmax = ymd('2022-01-01'),ymin = -Inf, ymax=Inf,alpha=0.25)
+plot.Meta.CountryTime
+
+ggsave("Figures/SuppFig2.pdf",dpi=300,units='cm',width=20,height=10)
+```
+
+```{r}
+ggarrange(
+  plot.Meta.SampleTypeTime,
+  plot.Meta.CountryTime,
+  nrow=2,ncol=1,
+  labels=c("A","B"),
+  align='v'
+)
+ggsave("Figures/TimeTypeCountry.pdf",dpi=300,width = 20,height = 20,units = 'cm')
+```
+
+
+#age sex bar graph
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(
+    InclusionExclusion == 'included',
+    UniquePatients == TRUE,
+    !is.na(sex),
+    !is.na(age)
+    ) %>%
+  mutate(
+    age_grouped = cut(age,breaks = c(0,10,20,30,40,50,60,70,80,90,100),right = F,labels=c("0-9","10-19","20-29","30-39","40-49","50-59","60-69","70-79","80-89","90-99")),
+    sex = case_when(is.na(sex) ~ 'No Data',T~sex)
+  ) %>%
+  ggplot(aes(x=age_grouped,fill=sex)) +
+  geom_bar(position = position_dodge(preserve = 'single')) +
+  scale_fill_manual(values = c("F"="#1b9e77","M"="#7570b3",'No Data'='grey'),labels=c("F"="Female","M"="Male")) +
+  theme_bw() +
+  labs(
+    x='Age of Patient at Time of Sample Collection (Grouped by Decade)',
+    y='Count of Cases',
+    fill="Patient Sex"
+  )
+
+ggsave("Figures/PatientDemography.pdf",dpi=300,units = 'cm',width = 18,height = 10)
+```
+
+#male female split
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == TRUE) %>%
+  group_by(sex) %>%
+  summarise(
+    count = n(),
+    mediange_age = median(age)
+    )
+```
+
+
+#median age
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == TRUE) %>%
+  summarise(median(age))
+```
+
+#genotypes over time bar
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == TRUE) %>%
+  count(ParaType_Genotype,sort = T)
+```
+
+
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == TRUE) %>%
+  mutate(
+    Quarter = floor_date(ymd(received_date),unit = 'quarter') + days(45)
+  ) %>%
+  group_by(Quarter,ParaType_Genotype) %>%
+  summarise(count=n()) %>%
+  ggplot(aes(x=Quarter,fill=ParaType_Genotype,y=count)) +
+  geom_bar(stat='identity') +
+  theme_bw() +
+  labs(
+    y="Case Count",
+    x="Date of Sample Receipt / Notification (Grouped by Quarter)",
+    fill="Genotype"
+  )
+```
+
+
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == TRUE) %>%
+  group_by(RegionOfTravel,ParaType_Genotype) %>%
+  summarise(count=n()) %>%
+  ggplot(aes(x=ParaType_Genotype,fill=RegionOfTravel,y=count)) +
+  geom_bar(stat = 'identity') +
+  theme_bw() +
+  labs(
+    y="Case Count",
+    x="Paratype Genotype",
+    fill="Region"
+  )
+```
+
+
+```{r}
+plot.fill.Country <- c(
+    'Cambodia' = '#7079df',
+    'Hong Kong (SAR of China)' = '#6aa859',
+    'India'='#c06fc2',
+    'Indonesia' = '#c2893c',
+    'Nepal' = '#5794d7',
+    'Pakistan' = '#d75f79',
+    'Unknown' = 'grey'
+    )
+
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == TRUE, InfectionSource=='Travel') %>%
+  group_by(CountryOfTravel,ParaType_Genotype) %>%
+  summarise(count=n()) %>%
+  ggplot(aes(x=ParaType_Genotype,fill=CountryOfTravel,y=count)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = plot.fill.Country) +
+  theme_bw() +
+  labs(
+    y="Case Count",
+    x="Paratype Genotype",
+    fill="Country"
+  )
+
+ggsave("Figures/GenotypeByCountry.pdf",dpi=300,units = 'cm',width = 22,height = 10)
+```
+
+
+# AMR bar graphs
+
+```{r}
+plot.fill.qrdr <- c(
+  "GyrA-S83F" = "#66c2a5",
+  "GyrA-S83Y" = "#fc8d62",
+  "GyrA-D87N" = "#8da0cb",
+  "GyrA-D87N & S83F" = "#e78ac3",
+  "GyrA-S83F & GyrB-E466D" = '#a6d854'
+)
+
+
+plot.AMR.genotype <- SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == T) %>%
+  count(ParaType_Genotype,Quinolone) %>%
+  mutate(Quinolone = case_when(
+    Quinolone == "" ~ "None",
+    T ~ Quinolone
+  )) %>%
+  ggplot(aes(x=ParaType_Genotype,y=n,fill=Quinolone)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(
+    values = c(
+      # 'None' = 'grey',
+      # 'gyrA_D87N' = '#e37861',
+      # 'gyrA_D87N,gyrA_S83F' = '#ceae3e',
+      # 'gyrA_S83F' = '#91c668',
+      # 'gyrA_S83F,gyrB_E466D' = '#52d5af',
+      # 'gyrA_S83Y' = '#bf80ce'
+      "None" = 'grey',
+  "gyrA_S83F" = "#66c2a5",
+  "gyrA_S83Y" = "#fc8d62",
+  "gyrA_D87N" = "#8da0cb",
+  "gyrA_D87N,gyrA_S83F" = "#e78ac3",
+  "gyrA_S83F,gyrB_E466D" = '#a6d854'
+    ),
+    labels = c(
+      'None' = 'None',
+      'gyrA_D87N' = 'GyrA-D87N',
+      'gyrA_D87N,gyrA_S83F' = 'GyrA-D87N & S83F',
+      'gyrA_S83F' = 'GyrA-S83F',
+      'gyrA_S83F,gyrB_E466D' = 'GyrA-S83F & GyrB-E466D',
+      'gyrA_S83Y' = 'GyrA-S83Y'
+    )
+  ) +
+  theme_bw() +
+  labs(
+    y="Case Count",
+    x="Paratype Genotype",
+    fill="Resistance"
+  ) +
+  theme(legend.text = element_markdown())
+plot.AMR.genotype
+```
+
+# Fisher's tests for associations between genotypes and QRDR mutations - needs cleaning
+
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == T) %>%
+  count(ParaType_Genotype, Quinolone, sort=T)
+```
+
+```{r}
+fisher_test <- SRGenomicsPlusMeta %>%
+  filter(
+    InclusionExclusion == 'included', 
+    UniquePatients == T, 
+    ParaType_Genotype %in% c( #only keep genotypes with more than 5 isolates
+      '2.4.2',
+      '2.3.3',
+      '2.3.4',
+      '2.4.1',
+      '2.3.2',
+      '2.3.1',
+      '2.4',
+      '2.4.3',
+      '2.4.5'
+      ))
+#get presence of S83Y mutation
+fisher_test$gyrAS83Y <- grepl("gyrA_S83Y", fisher_test[["Quinolone"]], fixed = TRUE)
+```
+
+run test on 2.3.4
+```{r}
+test <- table(fisher_test[["ParaType_Genotype"]] == "2.3.4", df$gyrAS83Y)
+test
+fisher.test(test)
+```
+
+run test on 2.4.5
+```{r}
+test <- table(fisher_test[["ParaType_Genotype"]] == "2.3.4", df$gyrAS83Y)
+test
+fisher.test(test)
+```
+
+# plot AMR against time
+```{r}
+plot.AMR.time <- SRGenomicsPlusMeta %>%
+  filter(
+    InclusionExclusion == 'included',
+    UniquePatients == TRUE
+    ) %>%
+  mutate(
+    Quarter = floor_date(ymd(received_date),unit = 'quarter') + days(45), #swap to received date as collection date is sometimes empty
+    Quinolone = case_when(
+    Quinolone == "" ~ "None",
+    T ~ Quinolone
+  )) %>%
+  group_by(Quarter,Quinolone) %>%
+  summarise(count=n()) %>%
+  #pivot_wider(names_from = ReportedTravel,names_prefix = "WGS_ReportedTravel_",values_from = count)
+  ggplot(aes(x=Quarter,fill=Quinolone,y=count)) +
+  geom_bar(stat='identity') +
+  scale_fill_manual(
+    values = c(
+      # 'None' = 'grey',
+      # 'gyrA_D87N' = '#e37861',
+      # 'gyrA_D87N,gyrA_S83F' = '#ceae3e',
+      # 'gyrA_S83F' = '#91c668',
+      # 'gyrA_S83F,gyrB_E466D' = '#52d5af',
+      # 'gyrA_S83Y' = '#bf80ce'
+            "None" = 'grey',
+  "gyrA_S83F" = "#66c2a5",
+  "gyrA_S83Y" = "#fc8d62",
+  "gyrA_D87N" = "#8da0cb",
+  "gyrA_D87N,gyrA_S83F" = "#e78ac3",
+  "gyrA_S83F,gyrB_E466D" = '#a6d854'
+    ),
+    labels = c(
+      'None' = 'None',
+      'gyrA_D87N' = 'GyrA-D87N',
+      'gyrA_D87N,gyrA_S83F' = 'GyrA-D87N & S83F',
+      'gyrA_S83F' = 'GyrA-S83F',
+      'gyrA_S83F,gyrB_E466D' = 'GyrA-S83F & GyrB-E466D',
+      'gyrA_S83Y' = 'GyrA-S83Y'
+    )
+  ) +
+  theme_bw() +
+  #theme(legend.title = element_blank()) +
+  labs(
+    y="Case Count",
+    x="Date of Sample Receipt (Grouped by Quarter)",
+    fill="Resistance",
+    #colour="National Disease Surveillance"
+  ) +
+  annotate('rect',xmin = ymd('2020-04-01'), xmax = ymd('2022-01-01'),ymin = -Inf, ymax=Inf,alpha=0.25) +
+  theme(legend.text = element_markdown())
+plot.AMR.time
+```
+
+# plot AMR against country
+```{r}
+plot.AMR.Country <- SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == T,InfectionSource=='Travel') %>%
+  count(CountryOfTravel,Quinolone) %>%
+  mutate(Quinolone = case_when(
+    Quinolone == "" ~ "None",
+    T ~ Quinolone
+  )) %>%
+  ggplot(aes(x=CountryOfTravel,y=n,fill=Quinolone)) +
+  geom_bar(stat = 'identity') +
+  scale_x_discrete(labels = c("Hong Kong (SAR of China)" = "Hong Kong\n(SAR of China)")) +
+  scale_fill_manual(
+    values = c(
+      # 'None' = 'grey',
+      # 'gyrA_D87N' = '#e37861',
+      # 'gyrA_D87N,gyrA_S83F' = '#ceae3e',
+      # 'gyrA_S83F' = '#91c668',
+      # 'gyrA_S83F,gyrB_E466D' = '#52d5af',
+      # 'gyrA_S83Y' = '#bf80ce'
+            "None" = 'grey',
+  "gyrA_S83F" = "#66c2a5",
+  "gyrA_S83Y" = "#fc8d62",
+  "gyrA_D87N" = "#8da0cb",
+  "gyrA_D87N,gyrA_S83F" = "#e78ac3",
+  "gyrA_S83F,gyrB_E466D" = '#a6d854'
+    ),
+    labels = c(
+      'None' = 'None',
+      'gyrA_D87N' = 'GyrA-D87N',
+      'gyrA_D87N,gyrA_S83F' = 'GyrA-D87N & S83F',
+      'gyrA_S83F' = 'GyrA-S83F',
+      'gyrA_S83F,gyrB_E466D' = 'GyrA-S83F & GyrB-E466D',
+      'gyrA_S83Y' = 'GyrA-S83Y'
+    )
+  ) +
+  theme_bw() +
+  labs(
+    y="Case Count",
+    x="Country of Travel",
+    fill="Resistance"
+  ) +
+    theme(
+      legend.text = element_markdown(),
+      axis.text.x = element_text(angle=45,hjust=1)
+      )
+plot.AMR.Country
+```
+
+```{r}
+#multipanel of amr
+ggarrange(plot.AMR.time,
+          #plot.AMR.Country,
+          plot.AMR.genotype,
+          common.legend = T,
+          legend="right",
+         labels = c("A","B"),
+         ncol=1,nrow=2)
+ggsave("Figures/AMRMultipanel.pdf",dpi=300,width = 20,height = 15,units = 'cm')
+```
+
+
+# Tree plotting and labelling
+
+Mid-point root tree
+```{r}
+raxmlTree.mpr <- midpoint(raxmlTree)
+```
+
+```{r}
+plot.tree <- ggtree(raxmlTree.mpr,layout = 'fan') + # %<+% SRGenomicsPlusMeta +
+  theme_tree() 
+plot.tree
+```
+
+#plot for finding internal node labels for clade labellling
+```{r}
+plot.tree <- ggtree(raxmlTree.mpr)  %<+% SRGenomicsPlusMeta +
+  theme_tree() +
+  geom_tippoint(aes(colour = ParaType_Secondary_clade)) +
+  scale_color_manual(values = c(
+    '2.4' = 'red'
+  )) +
+  geom_text2(aes(label=node,subset = (label=='Reference')), # Use node number as label
+             hjust = 1.3, # Adjust horizontal position
+             vjust = -.5)  # Adjust vertical position
+plot.tree
+#ggsave("Figures/temp.pdf",dpi=300,width=25,height = 20,units = 'cm')
+```
+
+#tree plot
+```{r}
+plot.tree <- ggtree(raxmlTree.mpr,layout = 'fan',open.angle = 25) + #%<+% SRGenomicsPlusMeta +
+  theme_tree() 
+
+plot.tree <- rotate_tree(plot.tree,90)
+
+clade.highlight.df <- data.frame(
+  id=c(
+    101, #1.2.2,
+    245, #2.0.1
+    #246, #2.3
+    236, #2.3.1
+    219, #2.3.2
+    225, #2.3.3
+    238, #2.3.4
+    #212, #2.4
+    249, #2.4.1
+    260, #2.4.2
+    257, #2.4.3
+    269, #2.4.4
+    272, #2.4.5
+    275, #2.4.6
+    270 #2.4.8
+    ),
+  Genotype=c(
+    "1.2.2",
+    "2.0.1",
+    "2.3.1",
+    "2.3.2",
+    "2.3.3",
+    "2.3.4",
+    "2.4.1",
+    "2.4.2",
+    "2.4.3",
+    "2.4.4",
+    "2.4.5",
+    "2.4.6",
+    "2.4.8"
+    )
+)
+  
+clade.highlight.df.cols <- c(
+  "1.2.2" = "#de2d26",
+  "2.0.1" = "#feb24c",
+  "2.3.1"='#fcc5c0',
+  "2.3.2"='#fa9fb5',
+  "2.3.3"='#f768a1',
+  "2.3.4"='#dd3497',
+  "2.4.1"='#edf8b1',
+  "2.4.2"='#c7e9b4',
+  "2.4.3"='#7fcdbb',
+  "2.4.4"='#41b6c4',
+  "2.4.5"='#1d91c0',
+  "2.4.6"='#225ea8',
+  "2.4.8"='#253494'
+)
+
+tree.Labelled <- plot.tree + #%<+% SRGenomicsPlusMeta +
+  geom_hilight(
+    data=clade.highlight.df,
+    mapping=aes(fill=Genotype,node=id),
+    alpha=1,
+    extendto=0.00006
+    )+
+  scale_fill_manual(values=clade.highlight.df.cols) +
+  #labels
+  #geom_cladelab(node=213,label="2.4",align=T,angle=0,hjust=0.5,offset.text = 0.000005) + #2.4
+  #geom_cladelab(node=215,label="2.3",align=T,angle=0,hjust=0.5,offset.text = 0.000005) + #2.3
+  #geom_cladelab(node=261,label="2.0.1",align=T,angle=90,hjust=0.5,offset.text = 0.000001) + #2.0.1
+  geom_tree() +
+  theme_tree() +
+  #theme(legend.position = c(0.15,0.85)) +
+  guides(fill=guide_legend(direction = 'vertical')) +
+  geom_treescale(x=0.000005,y=168,offset = 8) +
+  #geom_text(aes(label=node)) +
+  geom_label2(aes(subset = (node == 215),label='2.3'),nudge_x = -0.000005,fontface = 'bold',colour='white',fill='pink2') +
+  geom_label2(aes(subset = (node == 213),label='2.4'),nudge_x = -0.000005,fontface = 'bold', colour='white',fill='blue3') +
+  geom_tippoint(aes(subset=(node==94)),colour = 'black',size=2) #have to use node number to subset
+
+tree.Labelled
+```
+
+
+```{r}
+GenomicDataForTree <- SRGenomicsPlusMeta %>%
+  filter(SampleID %in% raxmlTree.mpr$tip.label) %>%
+  mutate(
+    CountryOfTravel = case_when(
+      InfectionSource == 'Close contact' ~ 'None (Close Contact)',
+      T ~ CountryOfTravel
+    )
+  )
+```
+
+Need to replace NA in country of travel with None
+
+```{r}
+qrdr <- GenomicDataForTree %>% #count(Quinolone)
+  mutate(
+   'gyrA & gyrB' = case_when(
+     grepl("gyrA_D87N,gyrA_S83F",Quinolone) ~ "GyrA-D87N & S83F",
+     grepl("gyrA_S83F,gyrB_E466D",Quinolone) ~ "GyrA-S83F & GyrB-E466D",
+     grepl("gyrA_D87N",Quinolone) ~ "GyrA-D87N",
+     grepl("gyrA_S83F",Quinolone) ~ "GyrA-S83F",
+     grepl("gyrA_S83Y",Quinolone) ~ "GyrA-S83Y"
+   )
+   ) 
+qrdr
+```
+
+
+
+```{r}
+oantigen <- GenomicDataForTree %>%
+  mutate(
+    "O-antigen Mutations" = case_when(
+      grepl("prt-C249C,wzx-G329D",ParaType_Mutations) ~ "RfbS-C249C & RfbX-G329D",
+      grepl("rmlD-G262S,wzx-G329D",ParaType_Mutations) ~ "RfbD-G262S & RfbX-G329D",
+      grepl("wzx-G329D",ParaType_Mutations) ~ "RfbX-G329D",
+      grepl("prt-C249C",ParaType_Mutations) ~ "RfbS-C249C",
+      grepl("rmlB-H176Y",ParaType_Mutations) ~ "RfbB-H176Y",
+      grepl("rmlC-E157K",ParaType_Mutations) ~ "RfbC-E157K",
+      grepl("rmlD-G262S",ParaType_Mutations) ~ "RfbD-G262S",
+    )
+  )
+```
+
+```{r}
+plasmidprofiles <- GenomicDataForTree %>%
+  mutate(
+    "Cryptic Plasmids" = case_when(
+      SampleID %in% pGY1sampleIDs ~ 'pAUSMDU00093977_2 / pGY1-like',
+      SampleID %in% pGY2sampleIDs ~ 'pAUSMDU00115364'
+    )
+  )
+```
+
+
+```{r}
+spacing <- 0.09
+treeHMwidths <- 0.000005
+
+plot.fill.qrdr <- c(
+  "GyrA-S83F" = "#66c2a5",
+  "GyrA-S83Y" = "#fc8d62",
+  "GyrA-D87N" = "#8da0cb",
+  "GyrA-D87N & S83F" = "#e78ac3",
+  "GyrA-S83F & GyrB-E466D" = '#a6d854'
+)
+
+plot.fill.rfb <- c(
+  "RfbB-H176Y" = "#a6cee3",
+  "RfbC-E157K" = "#1f78b4",
+  "RfbD-G262S" = "#b2df8a",
+  "RfbS-C249C" = "#33a02c",
+  "RfbX-G329D" = "#fb9a99",
+  "RfbD-G262S & RfbX-G329D" = "#e31a1c",
+  "RfbS-C249C & RfbX-G329D" = "#ff7f00"
+)
+
+plot.fill.Country <- c(
+    'Cambodia' = '#7079df',
+    'Hong Kong (SAR of China)' = '#6aa859',
+    'India'='#c06fc2',
+    'Indonesia' = '#c2893c',
+    'Nepal' = '#5794d7',
+    'Pakistan' = '#d75f79',
+    'Unknown' = 'grey',
+    'None (Close Contact)' = 'white'
+    )
+
+tree.Heatmaps <- tree.Labelled +
+  new_scale_fill() +
+  geom_fruit(
+    data=GenomicDataForTree,
+    geom = geom_tile,
+    mapping = aes(y=SampleID,x=0,fill=CountryOfTravel),
+    offset = spacing,
+    pwidth=treeHMwidths,
+    grid.params = list(add.grid=T)
+  ) +
+  scale_fill_manual(
+    values = plot.fill.Country,
+  na.value = NA,
+  na.translate = F,
+  name = "Country of Travel"
+  ) +
+  new_scale_fill() +
+  geom_fruit(
+    data = qrdr,
+    geom = geom_tile,
+    mapping = aes(y=SampleID,x=0,fill=`gyrA & gyrB`),
+    offset = spacing,
+    pwidth=treeHMwidths,
+    grid.params = list(add.grid=T)
+    ) +
+  scale_fill_manual(
+    values = plot.fill.qrdr,
+    breaks = names(plot.fill.qrdr),
+    na.value = NA,
+    na.translate = F,
+    name = "QRDR Mutations"
+  ) +
+  new_scale_fill() +
+  geom_fruit(
+    data =oantigen,
+    geom = geom_tile,
+    mapping = aes(y = SampleID, x=0, fill = `O-antigen Mutations`),
+    offset = spacing,
+    pwidth=treeHMwidths,
+    grid.params = list(add.grid=T)
+  ) +
+  scale_fill_manual(
+    values = plot.fill.rfb,
+    breaks = names(plot.fill.rfb),
+    na.value = NA,
+    na.translate = F,
+    name = "Rfb Mutations"
+  ) +
+  new_scale_fill() +
+  geom_fruit(
+    data = plasmidprofiles,
+    geom=geom_tile,
+    mapping = aes(y = SampleID, x=0, fill = `Cryptic Plasmids`),
+    offset = spacing,
+    pwidth=treeHMwidths,
+    grid.params = list(add.grid=T)
+  ) +
+    scale_fill_manual(
+      values = c(
+        "pAUSMDU00093977_2 / pGY1-like" = "red3",
+        "pAUSMDU00115364" = "blue3" #pGY2
+      ),
+      na.value = NA,
+      na.translate = F,
+      name = "Cryptic Plasmids"
+    ) 
+tree.Heatmaps
+
+ggsave("Figures/Figure2_raw.pdf",dpi=300,width = 40,height = 40,units = 'cm')
+```
+
+
+
+# Same patient
+
+Same patient, samples collected 6 years apart
+High snp distance, unlikely to be same isolate
+```{r}
+SNPdists %>%
+  filter(Sample1 %in% c("AUSMDU00025866","AUSMDU00095719"), Sample2 %in% c("AUSMDU00025866","AUSMDU00095719"))
+```
+
+Same patient MDR and non-MDR isolate
+only single SNP between isolates
+```{r}
+SNPdists %>%
+  filter(Sample1 %in% c("AUSMDU00093977","AUSMDU00093461"), Sample2 %in% c("AUSMDU00093977","AUSMDU00093461"))
+```
+
+# rfb locus
+
+## locus depth
+depth is raw depth for each sample
+NormDepth is depth divided by mean depth across entire genome
+
+
+```{r}
+rfbLocusDepth %>%
+  mutate(
+    GeneName = case_when(
+      pos >= 860000 & pos <= 867000 ~ 'LeaderChrom',
+      pos >= 867698 & pos <= 868538 ~ 'rfbS',
+      #pos >= 869620 & pos <= 870919 ~ 'rfbX',
+      #pos >= 870920 & pos <= 871922 ~ 'rfbV',
+      #pos >= 872496 & pos <= 873558 ~ 'rfbU',
+      pos >= 870332 & pos <= 873216 ~ 'Repeat',
+      #pos >= 870332 & pos <= 870919 ~ 'rfbXCterChunk',
+      #pos >= 872496 & pos <= 873216 ~ 'rfbUNterChunk',
+      T ~ 'temp_intergenic'
+    )
+  ) %>%
+  group_by(GeneName) %>%
+  summarise(
+    AvgNormDepth = mean(NormDepth)
+  )
+```
+
+
+```{r}
+#depth normalised to entire genome depth, averaged per genotype
+rfbLocusDepth %>%
+  left_join(SRGenomicsPlusMeta,by='SampleID') %>%
+  group_by(pos,ParaType_Genotype) %>%
+  summarise(MeanNormDepth = mean(NormDepth),.groups = 'drop') %>%
+  ggplot(aes(x=pos,y=MeanNormDepth)) +
+  # annotate('rect',xmin = 867698, xmax = 868538,ymin = -Inf, ymax=Inf,alpha=0.25)+ #rfbS  
+  # annotate('rect',xmin = 869620, xmax = 870919,ymin = -Inf, ymax=Inf,alpha=0.25)+ #rfbX
+  # annotate('rect',xmin = 870920, xmax = 871922,ymin = -Inf, ymax=Inf,alpha=0.25)+ #rfbV
+  # annotate('rect',xmin = 872496, xmax = 873558,ymin = -Inf, ymax=Inf,alpha=0.25)+ #rfbU
+  geom_vline(xintercept = 867698,color='blue4') +
+  annotate('rect',xmin = 870332, xmax = 873216,ymin = -Inf, ymax=Inf,alpha=0.25)+
+  geom_line() +
+  theme_bw() +
+  labs(
+    x="Genome Position in AKU_12601",
+    y="Average Normalised Sequencing Depth Per Basepair"
+  ) +
+  theme(axis.text.x = element_text(angle=90,vjust=0.5)) +
+  facet_wrap(~ParaType_Genotype)
+
+ggsave("Figures/SuppFig5.pdf",dpi=300,units='cm',width=35,height=20)
+```
+
+```{r}
+clade.highlight.df.cols.AllGenotypes <- c(
+  "1.2.2" = "#bd0026",
+  "2.0.1" = "#feb24c",
+  "2.3" = "#ae017e",
+  "2.3.1"='#fcc5c0',
+  "2.3.2"='#fa9fb5',
+  "2.3.3"='#f768a1',
+  "2.3.4"='#dd3497',
+  "2.4" = "#081d58",
+  "2.4.1"='#edf8b1',
+  "2.4.2"='#c7e9b4',
+  "2.4.3"='#7fcdbb',
+  "2.4.4"='#41b6c4',
+  "2.4.5"='#1d91c0',
+  "2.4.6"='#225ea8',
+  "2.4.8"='#253494'
+)
+
+plot.rfbDepth <- rfbLocusDepth %>%
+  left_join(SRGenomicsPlusMeta,by='SampleID') %>%
+  group_by(pos,ParaType_Genotype) %>%
+  summarise(MeanNormDepth = mean(NormDepth),.groups = 'drop') %>%
+  ggplot(aes(x=pos,y=MeanNormDepth,color=ParaType_Genotype)) +
+  #annotate('rect',xmin = 869620, xmax = 870919,ymin = -Inf, ymax=Inf,alpha=0.25)+ #rfbX
+  #annotate('rect',xmin = 870920, xmax = 871922,ymin = -Inf, ymax=Inf,alpha=0.25)+ #rfbV
+  #annotate('rect',xmin = 872496, xmax = 873558,ymin = -Inf, ymax=Inf,alpha=0.25)+ #rfbU
+  annotate('rect',xmin = 870332, xmax = 873216,ymin = -Inf, ymax=Inf,alpha=0.25,fill='grey')+ #repeated region
+  annotate('segment',x = 869620, xend=870919,y = 2.9,yend=2.9,lineend='butt',arrow=arrow(angle=90,ends = 'both'))+ #rfbX
+  #annotate('segment',x = 870600, xend=870919,y = 1.5,yend=1.5,lineend='butt',arrow=arrow(angle=90,ends = 'both'))+ #rfbX ter
+  annotate('label',x = (869620+870919)/2,y = 2.9,label="rfbX",fontface='italic')+ #rfbX
+  annotate('segment',x = 870920, xend=871922,y = 3.75,yend=3.75,lineend='butt',arrow=arrow(angle=90,ends = 'both'))+ #rfbV
+  #annotate('segment',x = 871100, xend=871500,y = 1.5,yend=1.5,lineend='butt',arrow=arrow(angle=90,ends = 'both'))+ #rfbV start
+  annotate('label',x = (870920+871922)/2,y = 3.75,label="rfbV",fontface='italic')+ #rfbV
+  annotate('segment',x = 872496, xend=873558,y = 4.5,yend=4.5,lineend='butt',arrow=arrow(angle=90,ends = 'both'))+ #rfbU
+  #annotate('segment',x = 872496, xend=873000,y = 1.5,yend=1.5,lineend='butt',arrow=arrow(angle=90,ends = 'both'))+ #rfbU start
+  annotate('label',x = (872496+873558)/2,y = 4.5,label="rfbU",fontface='italic')+ #rfbU
+  geom_line() +
+  scale_color_manual(
+    values = clade.highlight.df.cols.AllGenotypes,
+    name='Paratype Genotype') +
+  #scale_color_discrete(name='Paratype Genotype') +
+  theme_bw() +
+  xlim(869620,873558) +
+  ylim(0,5) +
+  labs(
+    x='Genome Position in AKU_12601',
+    y='Average Normalised Sequencing Depth\nPer Basepair'
+  )
+plot.rfbDepth
+```
+
+
+mean Chrom Norm depth can just be plotted as is
+
+raw depth needs to be normalised to rfbS
+
+
+```{r}
+RepeatOverS <- rfbLocusDepth %>%
+  mutate(
+    GeneName = case_when(
+      pos >= 867698 & pos <= 868538 ~ 'rfbS',
+      pos >= 870332 & pos <= 873216 ~ 'Repeat'
+    )
+  ) %>%
+  group_by(SampleID,GeneName) %>%
+  summarise(
+    meanRawdepth = mean(depth,na.rm=T), #average raw depth over loci
+    .groups = 'drop'
+  ) %>%
+  pivot_wider(names_from = GeneName,values_from = meanRawdepth) %>%
+  mutate(
+    RepeatOverS = Repeat / rfbS,
+  ) %>%
+  group_by(SampleID) %>%
+  summarise(
+    RepeatS = mean(RepeatOverS),.groups = 'drop'
+  )
+
+RepeatChromNorm <- rfbLocusDepth %>%
+  mutate(
+    GeneName = case_when(
+      pos >= 870332 & pos <= 873216 ~ 'RepeatChromNorm'
+    )
+  ) %>%
+  group_by(SampleID,GeneName) %>%
+  summarise(
+    meanChromNormdepth = mean(NormDepth,na.rm=T), #average Normalised depth
+    .groups = 'drop'
+  ) %>%
+  pivot_wider(names_from = GeneName,values_from = meanChromNormdepth) %>%
+  select(SampleID,RepeatChromNorm)
+
+LongReadGenomes <- SRGenomicsPlusMeta %>%
+  filter(!is.na(DMG_ID)) %>%
+  pull(SampleID)
+
+plot.rfbDepthNorm <- SRGenomicsPlusMeta %>%
+  left_join(RepeatOverS,by = 'SampleID') %>%
+  left_join(RepeatChromNorm,by='SampleID') %>%
+  filter(SampleID %in% includedSampleIDs) %>%
+  select(SampleID,RepeatS,RepeatChromNorm,ParaType_Genotype) %>%
+  pivot_longer(cols = c(RepeatS,RepeatChromNorm),names_to = "Normalization.Target",values_to = "NormalisedDepth") %>%
+  filter(!(is.infinite(NormalisedDepth))) %>% #remove one sample were rfbS is missing
+  mutate(
+    ClosedGenomes = case_when(
+      SampleID %in% c("AUSMDU00093461",LongReadGenomes) ~ 'Closed',
+      T ~ 'other'
+    )
+  ) %>%
+  ggplot(aes(y=NormalisedDepth,x=ParaType_Genotype,color=ClosedGenomes,size = ClosedGenomes,shape=ClosedGenomes)) +
+  geom_beeswarm(na.rm = T,fast = F) +
+  scale_color_manual(values = c("Closed" = 'red3', 'other'='black')) +
+  scale_size_manual(values = c("Closed" = 2.5,'other' = 1)) +
+  scale_shape_manual(values = c("Closed" = 17,'other' = 19)) +
+  guides(size='none',shape='none',color='none') +
+  theme_bw() +
+  theme(
+    strip.text = element_markdown(),
+    axis.text.x = element_text(angle=45,hjust=1)
+    ) +
+  labs(
+    x="Paratype Genotype",
+    y="Average Normalized Sequencing Depth\nOver 2.8kbp Repeat"
+  ) +
+  facet_wrap(~Normalization.Target,ncol=2,labeller=as_labeller(c(RepeatChromNorm = "Normalized to Full Genome",RepeatS="Normalized to *rfbS*")))
+
+plot.rfbDepthNorm
+```
+
+## gggenomes
+
+```{r}
+rfb_seqs <- read_seqs("../rfbgggenomes/rfbLocusAlignment/AllrfbLocus.fna")
+rfb_seqs
+```
+
+
+```{r}
+rfb_genes <- read_gff3("../rfbgggenomes/rfbLocusAlignment/bakta/AllrfbLocusBakta.gff3")
+rfb_genes
+```
+
+
+```{r}
+rfb_paf <- read_paf("../rfbgggenomes/rfbLocusAlignment/minimapping.paf")
+rfb_paf <- rfb_paf %>%
+  mutate(
+    Identity = (map_match / map_length) *100
+  )
+rfb_paf
+```
+
+
+SampleID	Min	Max
+DMG2401232	2927073	2960367 -> 2.3.1
+DMG2401233	1715331	1745728 -> 2.4.2
+DMG2401234	1919615	1947127 -> 2.0.1
+DMG2401236	2936457	2963969 -> 2.4.2
+DMG2401238	2894851	2922363 -> 2.3
+DMG2401239	2936752	2964264 -> 2.4
+AUSMDU -> 2.3.3
+
+Order to plot in
+AKU
+2.0.1
+2.3
+2.4
+2.4.2
+2.4.2
+2.3.1
+2.3.3
+
+Try colouring genes
+All rfb genes
+Genes that paratype reports SNPs for
+Repeated fragments?
+
+```{r}
+#chromosome_2927073-2960367 = DMG
+rfb_seqs_reorder <- rfb_seqs %>%
+  mutate(
+    seq_id = factor(seq_id,levels = c("AKU_12601","DMG2401234","DMG2401238","DMG2401239","DMG2401236","DMG2401233","DMG2401232","AUSMDU00127575")),
+    Genotype = case_when(
+      seq_id == "AKU_12601" ~ "AKU_12601\nReference Genome",
+      seq_id == "DMG2401232" ~ "AUSMDU00024150\n2.3.1",
+      seq_id == "DMG2401233" ~ "AUSMDU00025114\n2.4.2 (b)",
+      seq_id == "DMG2401234" ~ "AUSMDU00029268\n2.0.1",
+      seq_id == "DMG2401236" ~ "AUSMDU00030826\n2.4.2 (a)",
+      seq_id == "DMG2401238" ~ "AUSMDU00091465\n2.3",
+      seq_id == "DMG2401239" ~ "AUSMDU00019873\n2.4",
+      seq_id == 'AUSMDU00127575' ~ "AUSMDU00093461\n2.3.3"
+    )
+  ) %>%
+  arrange(seq_id)
+rfb_seqs_reorder
+```
+
+
+```{r}
+rfb_genes2 <- rfb_genes %>%
+  mutate(
+    Genotype = case_when(
+      seq_id == "AKU_12601" ~ "AKU_12601\nReference Genome",
+      seq_id == "DMG2401232" ~ "AUSMDU00024150 (2.3.1)",
+      seq_id == "DMG2401233" ~ "AUSMDU00025114 (2.4.2 (b))",
+      seq_id == "DMG2401234" ~ "AUSMDU00029268 (2.0.1)",
+      seq_id == "DMG2401236" ~ "AUSMDU00030826 (2.4.2 (a))",
+      seq_id == "DMG2401238" ~ "AUSMDU00091465 (2.3)",
+      seq_id == "DMG2401239" ~ "AUSMDU00019873 (2.4)",
+      seq_id == 'AUSMDU00127575' ~ "AUSMDU00093461 (2.3.3)"
+    ),
+    GeneFill = case_when(
+      gene == 'rfbX' ~ 'rfbX',
+      gene == 'rfbU' ~ 'rfbU',
+      gene %in% c("rfbS","rfbB","rfbC","rfbD") ~ "Paratype Surveyed Gene",
+      gene %in% c("rfbD","rfbA","rfbI","rfbF","rfbG","rfbH","rfbE","rfbN","rfbM","rfbK","rfbP") ~ "rfb Locus",
+      #some sort of highlighting for repeated elements?
+      #(is.na(gene)) & (grepl("Glycosyltransferase",product)) ~ "Glycosyltransferase",
+      # (is.na(gene)) & (grepl("MATE family efflux transporter",product)) ~ "MATE family efflux transporter",
+      # (is.na(gene)) & (grepl("Glycosyltransferase",product) & (grepl("RefSeq:WP_011233007.1",dbxref))) ~ "Glycosyltransferase (WP_011233007.1)",
+      # (is.na(gene)) & (grepl("Glycosyltransferase",product) & (grepl("RefSeq:WP_011233008.1",dbxref))) ~ "Glycosyltransferase (WP_011233008.1)",
+      # (is.na(gene)) & (grepl("Glycosyltransferase",product) & (grepl("RefSeq:WP_000636808.1",dbxref))) ~ "Glycosyltransferase (WP_000636808.1)",
+      # (is.na(gene)) & (grepl("Glycosyltransferase",product) & (grepl("RefSeq:WP_346244447.1",dbxref))) ~ "Glycosyltransferase (WP_346244447.1)",
+      # (is.na(gene)) & (grepl("Glycosyltransferase",product) & (grepl("UniRef:UniRef90_A0A626G5J1",dbxref))) ~ "Glycosyltransferase (UniRef90_A0A626G5J1)",
+      #rfbV
+      locus_tag %in% rfbVtags ~ "SPA rfbV",
+      #rfbfrags 435 U and X are the same locus tags
+      locus_tag %in% rfbXfrag.435 ~ "RfbU::X 435aa",
+      #rfbfrags 247 U and X are the same locus tags
+      locus_tag %in% rfbXfrag.247 ~ "RfbU::X 247aa",
+      #rfbX frag 210 U and X are tehe same locus tags
+      locus_tag %in% rfbXfrag.210 ~ "RfbU::X 210aa",
+      #rfbU frag 193
+      locus_tag %in% rfbUfrag.193 ~ "RfbU\u0394194-353ter",
+      #rfbU frag 206
+      locus_tag %in% rfbUfrag.206 ~ "RfbU\u03941206-353ter",
+      
+      # locus_tag %in% rfbXfrag.210 ~ "rfbX frag 210",
+      # locus_tag %in% rfbXfrag.247 ~ "rfbX frag 247",
+      # locus_tag %in% rfbXfrag.435 ~ "rfbX frag 435",
+      # locus_tag %in% rfbUfrag.193 ~ "rfbU frag 193",
+      # locus_tag %in% rfbUfrag.206 ~ "rfbU frag 206",
+      # locus_tag %in% rfbUfrag.210 ~ "rfbU frag 210",
+      # locus_tag %in% rfbUfrag.247 ~ "rfbU frag 247",
+      # locus_tag %in% rfbUfrag.435 ~ "rfbU frag 435",
+      T ~ "Other Gene"
+    )
+  )
+rfb_genes2
+```
+
+13 - U
+11 - X
+
+rfb frags 435
+1 - 244 is rfbU (1-244)
+241 to 435 is rfbX (233-427)
+
+rfb frags 247
+11 to 52 is rfbU (199-240)
+53 to 247 is rfbX (233-427)
+
+rfbXfrag.210 same for rfbUfrag 210
+1 to 15 is rfbU (226-240)
+16 to 210 is rfbX (233-427)
+
+rfbUfrag 193
+1-193 fragment of rfbU (1-193) delta 194-353ter
+
+rfbUfrag 206
+1-206 of rfbU (1-206) delta 207-353ter
+
+```{r}
+rfb_seqs_reorder
+```
+
+
+```{r}
+p <- gggenomes(genes = rfb_genes2,seqs = rfb_seqs_reorder,links = rfb_paf,infer_bin_id = Genotype) +
+  geom_seq() + 
+  scale_x_bp(suffix = "bp") +
+  theme(
+    axis.text.x = element_text(size = 10),
+    title = element_text(size = 10),
+    legend.text = element_markdown(),
+    legend.position = 'right',
+    legend.box = 'horizontal',
+    ) +
+  geom_link(aes(fill=Identity),alpha=0.5,inherit.aes = F) + 
+  scale_fill_continuous(
+    name="Nucleotide Identity",
+    palette = c("#EFEDF5", "#BCBDDC", "#756BB1"),
+    guide = guide_colorbar(order = 1)
+    )+
+  new_scale_fill() +
+  geom_gene(aes(fill=GeneFill),inherit.aes = F,size=4) + 
+  scale_fill_manual(name="Gene Label",
+  values = c(
+    "rfb Locus" = '#a1d99b',
+    "Paratype Surveyed Gene" = '#006d2c',
+    "rfbX" = "#08519c",
+    "rfbU" = "#a50f15",
+    "SPA rfbV" = "#dd3497",
+    #"Glycosyltransferase" = "#b2df8a",
+    "RfbU::X 435aa" = "#54278f",
+    "RfbU::X 247aa" = "#807dba",
+    "RfbU::X 210aa" = "#bcbddc",
+    "RfbU\u0394194-353ter" = "#ef3b2c",
+    "RfbU\u03941206-353ter" = "#fc9272",
+    "Other Gene" = 'grey'
+  ),
+  breaks = c(
+    "rfb Locus",
+    "Paratype Surveyed Gene",
+    "rfbX",
+    "rfbU",
+    "SPA rfbV",
+    #"Glycosyltransferase",
+    "RfbU::X 435aa",
+    "RfbU::X 247aa",
+    "RfbU::X 210aa",
+    "RfbU\u0394194-353ter",
+    "RfbU\u03941206-353ter",
+    "Other Gene"
+  ),
+  labels = c(
+    "*rfb* Locus",
+    "Paratype Surveyed Gene",
+    "*rfbX* (Paratype Surveyed)",
+    "*rfbU*",
+    "SPA *rfbV*",
+    #"Glycosyltransferase",
+    "RfbU::X 435aa",
+    "RfbU::X 247aa",
+    "RfbU::X 210aa",
+    "RfbU\u0394<sup>194-353ter</sup>",
+    "RfbU\u0394<sup>206-353ter</sup>",
+    "Other Gene"
+  ),
+  guide = guide_legend(order=2)
+  ) +
+  #labs(title = "Genotype") +
+  geom_bin_label(size = 4) #+
+  #geom_gene_note(aes(label = gene)) 
+p
+
+```
+
+```{r}
+plot.rfbgggenomes <- p %>%
+  add_links(rfb_paf) %>%
+  sync()
+plot.rfbgggenomes
+ggsave("Figures/rfbLocusAlignment.pdf",dpi=300,width=32.5,height = 15,units = 'cm',device = cairo_pdf)
+```
+
+
+# Plasmid
+
+```{r}
+SRGenomicsPlusMeta %>%
+  filter(InclusionExclusion == 'included', UniquePatients == TRUE) %>%
+  count(RepGeneAccessions,RelaxaseGeneAccessions,MpfGeneAccessions,OriTGeneAccessions,sort = T)
+```
+
+```{r}
+filelist <- Sys.glob("../plasmid/DMG2401232_EF088686_plasmid_blastresults/*.blasthits")
+filelist_nonempty <- filelist[which(file.info(filelist)$size>0)]
+```
+
+```{r}
+#cols  qseqid sseqid qlen slen length pident qcovs qcovhsp
+results <- lapply(filelist_nonempty,read.csv,header=F,sep='\t')
+names(results) <- unlist(lapply(filelist_nonempty,gsub,pattern='../plasmid/DMG2401232_EF088686_plasmid_blastresults/',replacement=''))
+mergedResults <- imap_dfr(results, ~ mutate(.x, id = .y))
+colnames(mergedResults) <- c("QueryID","SubjectID","QueryLen","SubjectLen","Length","Pident","Qcov","QcovHSP","SampleID")
+mergedResults %<>%
+  mutate(
+    SampleID = gsub(".blasthits","",SampleID)
+  )
+```
+
+```{r}
+sampleids <- mergedResults %>%
+  filter(Length > 2346) %>%
+  count(SampleID) %>%
+  pull(SampleID)
+
+length(sampleids)
+```
+
+```{r}
+#AUSMDU00093461 - patient matched isolate
+#AUSMDU00093977 - ESBL isolate
+
+'AUSMDU00093461' %in% sampleids
+'AUSMDU00093977' %in% sampleids
+```
+
+
+## cryptic plasmid new blast
+
+pGY1 3593
+pGY2 2607
+
+```{r}
+mergedResults
+```
+
+```{r}
+mergedResults %>%
+  filter(SampleID %in% includedSampleIDs) %>%
+  filter(
+    (QueryID == "pGY1_doubled" & Length > (3593*0.9)) | (QueryID=='pGY2_doubled' & Length > (2607*0.9)), Pident > 90
+  ) %>%
+  distinct(QueryID,SampleID) %>%
+  count(QueryID)
+```
+
+```{r}
+mergedResults %>%
+  filter(SampleID %in% includedSampleIDs) %>%
+  filter(
+    (QueryID == "pGY1_doubled" & Length > (3593*0.8)) | (QueryID=='pGY2_doubled' & Length > (2607*0.8)), Pident > 90
+  ) %>%
+  distinct(QueryID,SampleID) %>%
+  count(QueryID)
+```
+
+
+# Multipanel figures
+
+## Figure 1 
+
+```{r}
+ggarrange(
+  plot.NNDSandWGS +rremove('x.text') + rremove('x.title'),
+  plot.Meta.SampleTypeTime,
+  nrow=2,ncol=1,
+  labels=c("A","B"),
+  align='v'
+)
+ggsave("Figures/Figure1.pdf",dpi=300,width = 20,height = 20,units = 'cm')
+```
+
+## Figure 2
+
+```{r}
+tree.Heatmaps
+```
+
+## Figure 3
+
+```{r}
+#multipanel of amr
+ggarrange(plot.AMR.time,
+          #plot.AMR.Country,
+          plot.AMR.genotype,
+          common.legend = T,
+          legend="right",
+         labels = c("A","B"),
+         ncol=1,nrow=2)
+ggsave("Figures/AMRMultipanel.pdf",dpi=300,width = 22,height = 18,units = 'cm')
+```
+
+```{r}
+plot.AMR.Country
+
+ggsave("Figures/AMRbyCountry.pdf",dpi=300,units='cm',width=17,height=13)
+```
+
+
+## Figure 4
+
+```{r}
+plot.rfbDepth
+plot.rfbgggenomes
+plot.rfbDepthNorm
+```
+
+```{r}
+plot.rfbDepth
+
+ggsave("Figures/rfbLocusDepth.pdf",dpi=300,units='cm',width=25,height=10.5)
+```
+
+```{r}
+plot.rfbDepthNorm
+
+ggsave("Figures/rfbDepthNorm.pdf",dpi=300,units='cm',width=25,height=10.5)
+```
+
+
+```{r}
+ggarrange(NULL,
+          plot.rfbDepthNorm,
+          plot.rfbDepth,
+          NULL,
+          #common.legend = T,
+          legend="right",
+         labels = c("A","B","C"),
+         ncol=2,nrow=2)
+```
+
